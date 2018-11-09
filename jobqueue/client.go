@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -85,6 +86,8 @@ var (
 	ClientTouchInterval               = 15 * time.Second
 	ClientReleaseDelay                = 30 * time.Second
 	ClientPercentMemoryKill           = 90
+	ClientRetryWait                   = 15 * time.Second
+	ClientRetryTime                   = 24 * time.Hour
 	RAMIncreaseMin            float64 = 1000
 	RAMIncreaseMultLow                = 2.0
 	RAMIncreaseMultHigh               = 1.3
@@ -129,6 +132,7 @@ type Client struct {
 	ServerInfo *ServerInfo
 	host       string
 	port       string
+	args       []string // allowing internal reconnects
 }
 
 // envStr holds the []string from os.Environ(), for codec compatibility.
@@ -202,6 +206,7 @@ func Connect(addr, caFile, certDomain string, token []byte, timeout time.Duratio
 		clientid: u,
 		host:     addrParts[0],
 		port:     addrParts[1],
+		args:     []string{addr, caFile, certDomain},
 	}
 
 	// Dial succeeds even when there's no server up, so we test the connection
@@ -1001,6 +1006,7 @@ func (c *Client) Execute(job *Job, shell string) error {
 	stopChecking <- true
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
+	endTime := time.Now()
 
 	// though we have tried to track peak memory while the cmd ran (mainly to
 	// know if we use too much memory and kill during a run), our method might
@@ -1208,22 +1214,61 @@ func (c *Client) Execute(job *Job, shell string) error {
 
 	// though we may have had some problem, we always try and update our job end
 	// state, and we try many times to avoid having to repeat jobs unnecessarily
-	// (we keep retying for ~12+ hrs, giving plenty of time for issues to be
+	// (we keep retrying for 24hrs, giving plenty of time for issues to be
 	// fixed and potentially a new manager to be brought online for us to
 	// connect to and succeed)
-	maxRetries := 300
+	retryEnd := time.Now().Add(ClientRetryTime)
 	worked := false
+	disconnected := false
+	hadProblems := false
 	jes := &JobEndState{
 		Cwd:      actualCwd,
 		Exitcode: exitcode,
 		PeakRAM:  peakmem,
 		PeakDisk: peakdisk,
 		CPUtime:  cmd.ProcessState.SystemTime() + cmd.ProcessState.UserTime() + time.Duration(dockerCPU)*time.Second,
+		EndTime:  endTime,
 		Stdout:   finalStdOut,
 		Stderr:   finalStdErr,
 		Exited:   true,
 	}
-	for retryNum := 0; retryNum < maxRetries; retryNum++ {
+	for {
+		if disconnected {
+			// we've previously failed to contact the server
+			if time.Now().After(retryEnd) {
+				break
+			}
+
+			// try a quick connect attempt
+			newC, errc := Connect(c.args[0], c.args[1], c.args[2], c.token, 1*time.Second)
+			if errc != nil {
+				// keep retrying after a jittered sleep
+				wait := ClientRetryWait + time.Duration(rand.Float64()*0.5*float64(ClientRetryWait))
+				<-time.After(wait)
+				continue
+			}
+
+			// server is back, update ourselves and continue (we keep the quick
+			// timeout, but that should be good enough just to get through this)
+			disconnected = false
+			c.sock = newC.sock
+
+			// it's possible that our prior failed attempt to
+			// bury/release/archive failed because the server was down, but our
+			// message was still buffered "in" the socket, and when the server
+			// came back up it immediately received our message and processed
+			// it successfully, in which case trying to do this again will fail;
+			// check and see if the current state of the job matches what we're
+			// trying to do
+			current, errg := c.GetByEssence(job.ToEssense(), false, false)
+			if errg == nil && current != nil {
+				if (dobury && current.State == JobStateBuried) || (dorelease && (current.State == JobStateDelayed || current.State == JobStateBuried)) || (doarchive && current.State == JobStateComplete) {
+					worked = true
+					break
+				}
+			}
+		}
+
 		// update the database with our final state
 		if dobury {
 			err = c.Bury(job, jes, failreason)
@@ -1233,7 +1278,14 @@ func (c *Client) Execute(job *Job, shell string) error {
 			err = c.Archive(job, jes)
 		}
 		if err != nil {
-			<-time.After(time.Duration(retryNum*100) * time.Millisecond)
+			hadProblems = true
+			if !disconnected {
+				errd := c.Disconnect()
+				if errd == nil || strings.HasSuffix(errd.Error(), "connection closed") {
+					disconnected = true
+				}
+			}
+			<-time.After(ClientRetryWait)
 			continue
 		}
 		worked = true
@@ -1247,6 +1299,14 @@ func (c *Client) Execute(job *Job, shell string) error {
 			extra = fmt.Sprintf(" (and triggering behaviours failed: %s)", errt)
 		}
 		return fmt.Errorf("command [%s] finished running, but will need to be rerun due to a jobqueue server error: %s%s", job.Cmd, err, extra)
+	}
+
+	if hadProblems {
+		if myerr != nil {
+			myerr = fmt.Errorf("%s; %s", myerr.Error(), ErrStopReserving)
+		} else {
+			myerr = Error{"Execute", job.Key(), ErrStopReserving}
+		}
 	}
 
 	return myerr
@@ -1351,6 +1411,7 @@ type JobEndState struct {
 	PeakRAM  int
 	PeakDisk int64
 	CPUtime  time.Duration
+	EndTime  time.Time
 	Stdout   []byte
 	Stderr   []byte
 	Exited   bool
@@ -1370,6 +1431,7 @@ func (c *Client) ended(job *Job, jes *JobEndState) error {
 	job.PeakRAM = jes.PeakRAM
 	job.PeakDisk = jes.PeakDisk
 	job.CPUtime = jes.CPUtime
+	job.EndTime = jes.EndTime
 	if jes.Cwd != "" {
 		job.ActualCwd = jes.Cwd
 	}

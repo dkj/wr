@@ -54,6 +54,7 @@ var maxLocalCores int
 var maxLocalRAM int
 var cloudNoSecurityGroups bool
 var cloudUseConfigDrive bool
+var useCertDomain bool
 
 const kubernetes = "kubernetes"
 
@@ -72,9 +73,18 @@ the queue, it makes sure to spawn sufficient 'wr runner' agents to get them all
 run.
 
 You'll need to start this daemon with the 'start' sub-command before you can
-achieve anything useful with the other wr commands. If the background
-process that is spawned when you run this dies, your workflows will become
-stalled until you run the 'start' sub-command again.`,
+achieve anything useful with the other wr commands.
+
+If the background process that is spawned when you run this dies, any commands
+from your workflows that were running at the time will continue to run. If
+they're still running when you start the manager again, the new manager will
+pick them up and things will continue normally. If they finish running while the
+manager is dead, you have 24hrs to start the manager again; if you do so then
+their completed state will be recorded and things will continue normally. If
+more than 24hrs pass, however, the fact that the commands completed will not be
+known by the new manager, and they will eventually appear in "lost contact"
+state. You will have to then confirm them as dead and retry them from the start
+(even though they had actually completed).`,
 }
 
 // start sub-command starts the daemon
@@ -90,8 +100,7 @@ are by default found in ~/.wr_[deployment]/log.
 If using the openstack scheduler, note that you must be running on an OpenStack
 server already. Be sure to set --local_username to your username outside of the
 cloud, so that resources created will not conflict with anyone else in your
-tenant (project) also running wr. Your server's security group must also allow
-the ports that wr will use (see wr's config file).
+tenant (project) also running wr.
 Instead you can use 'wr cloud deploy -p openstack' to create an OpenStack server
 on which wr manager will be started in OpenStack mode for you. See 'wr cloud
 deploy -h' for the details of which environment variables you need to use the
@@ -102,6 +111,13 @@ pod. Be sure to pass a namespace for wr to use that will not have another wr
 user attempting to use it.
 Instead it is recommended to use 'wr kubernetes deploy' to bootstrap wr to a
 cluster.
+
+The --use_cert_domain option is intended for use when you have configured your
+own security certificates and want the manager to be reachable at a given
+domain name, because there is a risk of the manager's server going down and you
+want to be able to bring a new server up (at potentially a different IP address)
+and have clients on other servers be able to reconnect to the new manager (after
+you set the domain to point to the new manager's server's IP).
 
 If you want to start multiple managers up in different OpenStack networks that
 you've created yourself, note that --local_username will need to be globally
@@ -144,13 +160,6 @@ fully.`,
 			}
 		}
 
-		// delete any old token file, so that we later know when the manager has
-		// created a new one
-		err := os.Remove(config.ManagerTokenFile)
-		if err != nil && !os.IsNotExist(err) {
-			die("could not remove token file [%s]: %s", config.ManagerTokenFile, err)
-		}
-
 		if scheduler == kubernetes {
 			if len(kubeNamespace) == 0 {
 				die("namespace must be specified when using the kubernetes scheduler")
@@ -158,6 +167,16 @@ fully.`,
 			if len(configMapName) == 0 && len(postCreationScript) == 0 {
 				die("either a config map name or path to a post creation script is required")
 			}
+		}
+
+		// later, we will wait for the daemonized manager to either create a new
+		// token file, or if we already have one, to touch it, so we store the
+		// time now to know when the touch happens
+		preStart := time.Now()
+
+		// if we already have a token file, warn the user
+		if _, errs := os.Stat(config.ManagerTokenFile); errs == nil {
+			warn("will re-use the existing token in %s", config.ManagerTokenFile)
 		}
 
 		// now daemonize unless in foreground mode
@@ -170,7 +189,7 @@ fully.`,
 				// parent; wait a while for our child to bring up the manager
 				// before exiting
 				mTimeout := time.Duration(managerTimeoutSeconds) * time.Second
-				internal.WaitForFile(config.ManagerTokenFile, mTimeout)
+				internal.WaitForFile(config.ManagerTokenFile, preStart, mTimeout)
 				jq := connect(mTimeout, true)
 				if jq == nil {
 					// display any error or crit lines in the log
@@ -239,10 +258,7 @@ commands they were running. It is more graceful to use 'drain' instead.`,
 				warn("according to the pid file %s, wr manager was running with pid %d, and I terminated that pid, but the manager is still up on port %s!", config.ManagerPidFile, pid, config.ManagerPort)
 			} else {
 				info("wr manager running on port %s was gracefully shut down", config.ManagerPort)
-				err = os.Remove(config.ManagerTokenFile)
-				if err != nil {
-					warn("failed to remove token file: %s", err)
-				}
+				deleteToken()
 				return
 			}
 		} else {
@@ -287,10 +303,7 @@ commands they were running. It is more graceful to use 'drain' instead.`,
 
 		if stopped {
 			info("wr manager running at %s was gracefully shut down", sAddr)
-			err = os.Remove(config.ManagerTokenFile)
-			if err != nil {
-				warn("failed to remove token file: %s", err)
-			}
+			deleteToken()
 		} else {
 			die("I've tried everything; giving up trying to stop the manager at %s", sAddr)
 		}
@@ -321,6 +334,10 @@ down will be lost.`,
 		jq := connect(5*time.Second, true)
 		if jq == nil {
 			die("could not connect to the manager on port %s, so could not initiate a drain; has it already been stopped?", config.ManagerPort)
+			// *** this would happen after calling drain a few times and the
+			// manager has finally stopped itself, but we don't know if the
+			// the manager stopped cleanly in response to our drain, or if it
+			// crashed and there are still runners, so we can't deleteToken()...
 		}
 
 		// we managed to connect to the daemon; ask it to go in to drain mode
@@ -331,6 +348,7 @@ down will be lost.`,
 
 		if numLeft == 0 {
 			info("wr manager running on port %s is drained: there were no jobs still running, so the manger should stop right away.", config.ManagerPort)
+			deleteToken()
 		} else if numLeft == 1 {
 			info("wr manager running on port %s is now draining; there is a job still running, and it should complete in less than %s", config.ManagerPort, etc)
 		} else {
@@ -451,6 +469,7 @@ func init() {
 	managerStartCmd.Flags().BoolVar(&cloudNoSecurityGroups, "cloud_disable_security_groups", false, "for cloud schedulers, disable the use of security groups on spawned servers")
 	managerStartCmd.Flags().StringVar(&cloudConfigFiles, "cloud_config_files", defaultConfig.CloudConfigFiles, "for cloud schedulers, comma separated paths of config files to copy to spawned servers")
 	managerStartCmd.Flags().BoolVar(&setDomainIP, "set_domain_ip", defaultConfig.ManagerSetDomainIP, "on success, use infoblox to set your domain's IP")
+	managerStartCmd.Flags().BoolVar(&useCertDomain, "use_cert_domain", false, "if cert domain is configured, provide it to spawned clients instead of our IP address")
 	managerStartCmd.Flags().BoolVar(&managerDebug, "debug", false, "include extra debugging information in the logs")
 
 	managerBackupCmd.Flags().StringVarP(&backupPath, "path", "p", "", "backup file path")
@@ -613,6 +632,7 @@ func startJQ(postCreation []byte) {
 		CertFile:        config.ManagerCertFile,
 		KeyFile:         config.ManagerKeyFile,
 		CertDomain:      config.ManagerCertDomain,
+		DomainMatchesIP: useCertDomain,
 		Deployment:      config.Deployment,
 		CIDR:            serverCIDR,
 		Logger:          serverLogger,
@@ -644,5 +664,16 @@ func startJQ(postCreation []byte) {
 		default:
 			warn("wr manager on %s exited unexpectedly: %s", saddr, err)
 		}
+	}
+}
+
+// deleteToken should be called on successful, known clean stop of the manager,
+// so that the next time the manager is started it will create a new token.
+// For un-clean exits of the manager, we should keep the token so the manager
+// re-uses it, allowing any runners to reconnect.
+func deleteToken() {
+	err := os.Remove(config.ManagerTokenFile)
+	if err != nil && !os.IsNotExist(err) {
+		warn("could not remove token file [%s]: %s", config.ManagerTokenFile, err)
 	}
 }

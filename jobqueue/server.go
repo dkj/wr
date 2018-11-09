@@ -73,6 +73,7 @@ const (
 	ErrMustReserve      = "you must Reserve() a Job before passing it to other methods"
 	ErrDBError          = "failed to use database"
 	ErrPermissionDenied = "bad token: permission denied"
+	ErrStopReserving    = "recovered on a new server; you should stop reserving"
 	ServerModeNormal    = "started"
 	ServerModeDrain     = "draining"
 )
@@ -309,6 +310,15 @@ type ServerConfig struct {
 	// running your server.
 	CertDomain string
 
+	// If using a CertDomain, and if you have (or very soon will) set the domain
+	// to point to the server's IP address, set this to true. This will result
+	// in runner clients spawned by the server being told to access the server
+	// at CertDomain (instead of the current IP address), which means if the
+	// server's host is lost and you bring it back at a different IP address and
+	// update the domain again, those clients will be able to reconnect and
+	// continue running.
+	DomainMatchesIP bool
+
 	// Name of the deployment ("development" or "production"); development
 	// databases are deleted and recreated on start up by default.
 	Deployment string
@@ -348,9 +358,9 @@ type ServerConfig struct {
 // handles those clients.
 //
 // It returns a *Server that you will typically call Block() on to block until
-// until your executable receives a SIGINT or SIGTERM, or you call Stop(), at
-// which point the queues will be safely closed (you'd probably just exit at
-// that point).
+// your executable receives a SIGINT or SIGTERM, or you call Stop(), at which
+// point the queues will be safely closed (you'd probably just exit at that
+// point).
 //
 // If it creates a db file or recreates one from backup, and if it creates TLS
 // certificates, it will say what it did in the returned msg string.
@@ -359,7 +369,9 @@ type ServerConfig struct {
 // is a single user system, so there is only 1 token kept for its entire
 // lifetime. If config.TokenFile has been set, the token will also be written to
 // that file, potentially making it easier for any CLI clients to authenticate
-// with this returned Server.
+// with this returned Server. If that file already exists prior to calling this,
+// the token in that file will be re-used, allowing reconnection of existing
+// clients if this server dies ungracefully.
 //
 // The possible errors from Serve() will be related to not being able to start
 // up at the supplied address; errors encountered while dealing with clients are
@@ -384,7 +396,7 @@ func Serve(config ServerConfig) (s *Server, msg string, token []byte, err error)
 	defer internal.LogPanic(serverLogger, "jobqueue serve", true)
 
 	// generate a secure token for clients to authenticate with
-	token, err = generateToken()
+	token, err = generateToken(config.TokenFile)
 	if err != nil {
 		return s, msg, token, err
 	}
@@ -499,12 +511,17 @@ func Serve(config ServerConfig) (s *Server, msg string, token []byte, err error)
 
 	// if we end up spawning clients on other machines, they'll need to know
 	// our non-loopback ip address so they can connect to us
-	ip, err := internal.CurrentIP(config.CIDR)
-	if err != nil {
-		serverLogger.Error("getting current IP failed", "err", err)
-	}
-	if ip == "" {
-		return s, msg, token, Error{"Serve", "", ErrNoHost}
+	var ip string
+	if config.DomainMatchesIP {
+		ip = config.CertDomain
+	} else {
+		ip, err = internal.CurrentIP(config.CIDR)
+		if err != nil {
+			serverLogger.Error("getting current IP failed", "err", err)
+		}
+		if ip == "" {
+			return s, msg, token, Error{"Serve", "", ErrNoHost}
+		}
 	}
 
 	// we will spawn runner clients via the requested job scheduler
@@ -555,6 +572,17 @@ func Serve(config ServerConfig) (s *Server, msg string, token []byte, err error)
 		return nil, msg, token, err
 	}
 	if len(priorJobs) > 0 {
+		var loginUser string
+		var ttd time.Duration
+		if cloudConfig, ok := config.SchedulerConfig.(scheduler.CloudConfig); ok {
+			// *** for server recovery purposes, which involves ssh'ing to
+			// existing servers and monitoring them, we need to know the login
+			// username, but we don't. The best we can do is hope the configured
+			// default username is the right one
+			loginUser = cloudConfig.GetOSUser()
+			ttd = cloudConfig.GetServerKeepTime()
+		}
+
 		var itemdefs []*queue.ItemDef
 		for _, job := range priorJobs {
 			var deps []string
@@ -568,6 +596,12 @@ func Serve(config ServerConfig) (s *Server, msg string, token []byte, err error)
 			switch job.State {
 			case JobStateRunning:
 				itemdef.StartQueue = queue.SubQueueRun
+
+				req := reqForScheduler(job.Requirements)
+				errr := s.scheduler.Recover(fmt.Sprintf(s.rc, req.Stringify(), s.ServerInfo.Deployment, s.ServerInfo.Addr, s.ServerInfo.Host, s.scheduler.ReserveTimeout(req), int(s.scheduler.MaxQueueTime(req).Minutes())), req, &scheduler.RecoveredHostDetails{Host: job.Host, UserName: loginUser, TTD: ttd})
+				if errr != nil {
+					s.Warn("recovery of an old cmd failed", "cmd", job.Cmd, "host", job.Host)
+				}
 			case JobStateBuried:
 				itemdef.StartQueue = queue.SubQueueBury
 			}
@@ -1116,22 +1150,7 @@ func (s *Server) createQueue() {
 				noRec = true
 			}
 
-			var req *scheduler.Requirements
-			if job.Requirements.RAM < 924 {
-				// our req will be like the jobs but with memory + 100 to
-				// allow some leeway in case the job scheduler calculates
-				// used memory differently, and for other memory usage
-				// vagaries
-				req = &scheduler.Requirements{
-					RAM:   job.Requirements.RAM + 100,
-					Time:  job.Requirements.Time,
-					Cores: job.Requirements.Cores,
-					Disk:  job.Requirements.Disk,
-					Other: job.Requirements.Other,
-				}
-			} else {
-				req = job.Requirements
-			}
+			req := reqForScheduler(job.Requirements)
 
 			prevSchedGroup := job.getSchedulerGroup()
 			schedulerGroup := req.Stringify()

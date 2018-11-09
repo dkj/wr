@@ -341,11 +341,21 @@ within OpenStack.`,
 			}
 		}
 
+		if setDomainIP {
+			err = internal.InfobloxSetDomainIP(config.ManagerCertDomain, server.IP)
+			if err != nil {
+				warn("failed to set domain IP: %s", err)
+				setDomainIP = false
+			} else {
+				info("set IP of %s to %s", config.ManagerCertDomain, server.IP)
+			}
+		}
+
 		// ssh to the server, copy over our exe, and start running wr manager
 		// there
 		if !alreadyUp {
 			info("please wait while I start 'wr manager' on the %s server at %s...", providerName, server.IP)
-			bootstrapOnRemote(provider, server, exe, mp, wp, keyPath, usingExistingServer)
+			bootstrapOnRemote(provider, server, exe, mp, wp, keyPath, usingExistingServer, setDomainIP)
 
 			// rather than daemonize and use a go ssh forwarding library or
 			// implement myself using the net package, since I couldn't get them
@@ -386,15 +396,6 @@ within OpenStack.`,
 			err = cmd.Run()
 			if err != nil {
 				warn("--on_success executable [%s] failed: %s", postDeploymentScript, err)
-			}
-		}
-
-		if setDomainIP {
-			err = internal.InfobloxSetDomainIP(jq.ServerInfo.Host, server.IP)
-			if err != nil {
-				warn("failed to set domain IP: %s", err)
-			} else {
-				info("set IP of %s to %s", jq.ServerInfo.Host, server.IP)
 			}
 		}
 	},
@@ -617,7 +618,7 @@ func init() {
 	cloudTearDownCmd.Flags().BoolVar(&cloudDebug, "debug", false, "show details of the teardown process")
 }
 
-func bootstrapOnRemote(provider *cloud.Provider, server *cloud.Server, exe string, mp int, wp int, keyPath string, wrMayHaveStarted bool) {
+func bootstrapOnRemote(provider *cloud.Provider, server *cloud.Server, exe string, mp int, wp int, keyPath string, wrMayHaveStarted bool, domainMatchesIP bool) {
 	// upload ourselves to /tmp
 	remoteExe := filepath.Join(cloudBinDir, "wr")
 	err := server.UploadFile(exe, remoteExe)
@@ -649,6 +650,13 @@ func bootstrapOnRemote(provider *cloud.Provider, server *cloud.Server, exe strin
 	if err = server.CreateFile(fmt.Sprintf("managerport: \"%d\"\nmanagerweb: \"%d\"\nmanagerdbbkfile: \"%s\"\nmanagercertdomain: \"%s\"\n", mp, wp, dbBk, config.ManagerCertDomain), wrConfigFileName); err != nil {
 		teardown(provider)
 		die("failed to create our config file on the server at %s: %s", server.IP, err)
+	}
+
+	// copy over our token file, if we're in a recovery situation
+	if _, errf := os.Stat(config.ManagerTokenFile); errf == nil {
+		if errf = server.UploadFile(config.ManagerTokenFile, filepath.Join("./.wr_"+config.Deployment, "client.token")); errf == nil {
+			info("copied existing client.token to remote server")
+		}
 	}
 
 	if _, _, err = server.RunCmd("chmod u+x "+remoteExe, false); err != nil && !wrMayHaveStarted {
@@ -792,7 +800,11 @@ func bootstrapOnRemote(provider *cloud.Provider, server *cloud.Server, exe strin
 		if cloudDebug {
 			debugStr = " --debug"
 		}
-		mCmd := fmt.Sprintf("source %s && %s manager start --deployment %s -s %s -k %d -o '%s' -r %d -m %d -u %s%s%s%s%s  --cloud_cidr '%s' --local_username '%s' --max_cores %d --max_ram %d --timeout %d%s && rm %s", wrEnvFileName, remoteExe, config.Deployment, providerName, serverKeepAlive, osPrefix, osRAM, m, osUsername, postCreationArg, flavorArg, osDiskArg, configFilesArg, cloudCIDR, cloudResourceNameUniquer, maxManagerCores, maxManagerRAM, cloudManagerTimeoutSeconds, debugStr, wrEnvFileName)
+		useCertDomainStr := ""
+		if domainMatchesIP {
+			useCertDomainStr = " --use_cert_domain"
+		}
+		mCmd := fmt.Sprintf("source %s && %s manager start --deployment %s -s %s -k %d -o '%s' -r %d -m %d -u %s%s%s%s%s  --cloud_cidr '%s' --local_username '%s' --max_cores %d --max_ram %d --timeout %d%s%s && rm %s", wrEnvFileName, remoteExe, config.Deployment, providerName, serverKeepAlive, osPrefix, osRAM, m, osUsername, postCreationArg, flavorArg, osDiskArg, configFilesArg, cloudCIDR, cloudResourceNameUniquer, maxManagerCores, maxManagerRAM, cloudManagerTimeoutSeconds, useCertDomainStr, debugStr, wrEnvFileName)
 
 		var e string
 		_, e, err = server.RunCmd(mCmd, false)
