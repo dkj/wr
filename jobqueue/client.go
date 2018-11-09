@@ -1252,6 +1252,21 @@ func (c *Client) Execute(job *Job, shell string) error {
 			// timeout, but that should be good enough just to get through this)
 			disconnected = false
 			c.sock = newC.sock
+
+			// it's possible that our prior failed attempt to
+			// bury/release/archive failed because the server was down, but our
+			// message was still buffered "in" the socket, and when the server
+			// came back up it immediately received our message and processed
+			// it successfully, in which case trying to do this again will fail;
+			// check and see if the current state of the job matches what we're
+			// trying to do
+			current, errg := c.GetByEssence(job.ToEssense(), false, false)
+			if errg == nil && current != nil {
+				if (dobury && current.State == JobStateBuried) || (dorelease && (current.State == JobStateDelayed || current.State == JobStateBuried)) || (doarchive && current.State == JobStateComplete) {
+					worked = true
+					break
+				}
+			}
 		}
 
 		// update the database with our final state
@@ -1266,7 +1281,7 @@ func (c *Client) Execute(job *Job, shell string) error {
 			hadProblems = true
 			if !disconnected {
 				errd := c.Disconnect()
-				if errd == nil {
+				if errd == nil || strings.HasSuffix(errd.Error(), "connection closed") {
 					disconnected = true
 				}
 			}
