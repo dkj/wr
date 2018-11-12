@@ -317,6 +317,7 @@ func (p *openstackp) getImageFromCache(prefix string) *images.Image {
 
 // deploy achieves the aims of Deploy().
 func (p *openstackp) deploy(resources *Resources, requiredPorts []int, useConfigDrive bool, gatewayIP, cidr string, dnsNameServers []string) error {
+fmt.Println("cidr is " + cidr)
 	// the resource name can only contain letters, numbers, underscores,
 	// spaces and hyphens
 	if !openstackValidResourceNameRegexp.MatchString(resources.ResourceName) {
@@ -444,20 +445,26 @@ func (p *openstackp) deploy(resources *Resources, requiredPorts []int, useConfig
 		// work out our network uuid, needed for spawning later
 	NETWORKS:
 		for networkName := range p.ownServer.Addresses {
+fmt.Println("networkName is " + networkName)
 			networkUUID, erri := networks.IDFromName(p.networkClient, networkName)
 			if erri != nil {
 				return erri
 			}
+fmt.Println("networkUUID is " + networkUUID)
 			if networkUUID != "" {
 				network, errg := networks.Get(p.networkClient, networkUUID).Extract()
 				if errg != nil {
 					return errg
 				}
+fmt.Println("network is %v" , network)
 				for _, subnetID := range network.Subnets {
+fmt.Println("  subnetID is " + subnetID)
 					subnet, errg := subnets.Get(p.networkClient, subnetID).Extract()
+fmt.Println("  subnet is %v" , subnet)
 					if errg != nil {
 						return errg
 					}
+fmt.Println("  subnet.CIDR is " + subnet.CIDR)
 					if subnet.CIDR == cidr {
 						p.networkName = networkName
 						p.networkUUID = networkUUID
@@ -684,7 +691,7 @@ func (p *openstackp) getQuota() (*Quota, error) {
 			quota.UsedInstances++
 			f, errf := p.getFlavor(server.Flavor["id"].(string))
 			if errf != nil {
-				return false, errf
+			//	return false, errf
 			}
 			if f != nil { // should always be found...
 				quota.UsedCores += f.Cores
